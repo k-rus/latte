@@ -1,0 +1,163 @@
+use latte::*;
+
+pub const KEYSPACE = latte::param!("keyspace", "latte");
+pub const TABLE = latte::param!("table", "events_cdc");
+
+// Total number of rows in the table:
+pub const ROW_COUNT = latte::param!("rows", 100000);
+
+// Total number of partitions in the table:
+pub const PAR_COUNT = latte::param!("partitions", 1000);
+
+// Column cardinalities:
+pub const LC = latte::param!("lc", 10);
+pub const MC = latte::param!("mc", 100);
+pub const HC = latte::param!("hc", 1000);
+
+pub const TIME_DELTA = latte::param!("time_delta", 1000);
+
+// Limit on the number of rows to fetch in a single query:
+pub const READ_SIZE = latte::param!("read_size", 10);
+
+const WRITE = "write";
+const READ = "read";
+
+pub async fn schema(db) {
+    db.execute(`
+        CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE}
+            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1 }`).await?;
+    db.execute(`
+        DROP TABLE IF EXISTS ${KEYSPACE}.${TABLE}`).await?;
+
+    db.execute(`
+        CREATE TABLE IF NOT EXISTS ${KEYSPACE}.${TABLE} (
+            site_id int,
+            time_bucket bigint,
+            event_date bigint,
+            eqid text,
+            event_type_id bigint,
+            emu_event_id bigint,
+            alarm_id text,
+            created_at timestamp,
+            event_clear_date bigint,
+            has_state int,
+            ho_event int,
+            message_key int,
+            message_params text,
+            standing int,
+            updated_at timestamp,
+            PRIMARY KEY (site_id, time_bucket, event_date, eqid, event_type_id, emu_event_id)
+        ) WITH CLUSTERING ORDER BY (time_bucket DESC, event_date DESC, eqid ASC, event_type_id ASC, emu_event_id ASC)
+    `).await?;
+
+    db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ON ${KEYSPACE}.${TABLE}(alarm_id) USING 'StorageAttachedIndex'`).await?;
+    db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ON ${KEYSPACE}.${TABLE}(eqid) USING 'StorageAttachedIndex'`).await?;
+    db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ON ${KEYSPACE}.${TABLE}(event_date) USING 'StorageAttachedIndex'`).await?;
+    db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ON ${KEYSPACE}.${TABLE}(time_bucket) USING 'StorageAttachedIndex'`).await?;
+    db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ON ${KEYSPACE}.${TABLE}(event_type_id) USING 'StorageAttachedIndex'`).await?;
+    db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ON ${KEYSPACE}.${TABLE}(has_state) USING 'StorageAttachedIndex'`).await?;
+    db.execute(`CREATE CUSTOM INDEX IF NOT EXISTS ON ${KEYSPACE}.${TABLE}(standing) USING 'StorageAttachedIndex'`).await?;
+    Ok(())
+}
+
+pub async fn erase(db) {
+    db.execute(`TRUNCATE TABLE ${KEYSPACE}.${TABLE}`).await?;
+    Ok(())
+}
+
+pub async fn prepare(db) {
+    db.load_cycle_count = ROW_COUNT;
+    db.prepare(WRITE,
+        `INSERT INTO ${KEYSPACE}.${TABLE}(
+            site_id,
+            time_bucket,
+            event_date,
+            eqid,
+            event_type_id,
+            emu_event_id,
+            alarm_id,
+            created_at,
+            event_clear_date,
+            has_state,
+            ho_event,
+            message_key,
+            message_params,
+            standing,
+            updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).await?;
+    db.prepare(READ, `SELECT * FROM ${KEYSPACE}.${TABLE} WHERE site_id=? AND time_bucket>=? AND time_bucket<=? AND event_date<=? AND event_date>=? AND event_type_id=? LIMIT ${READ_SIZE} allow filtering`).await?;
+    Ok(())
+}
+
+pub async fn load(db, i) {
+    // Generate values for all 15 columns matching the table schema
+    let site_id = hash_range(i, PAR_COUNT);
+    // Spread event_date across multiple consecutive days (e.g., 30 days)
+    let base_timestamp = 1700000000000; // Base timestamp in milliseconds
+    let days_to_spread = 30; // Number of consecutive days
+    let event_date = base_timestamp + (i * days_to_spread * 86400000 / ROW_COUNT);
+    // created_at varies throughout the entire day (86400 seconds)
+    let created_at = event_date + (hash2(i, 8) % 86400) * 1000; // Add 0-86400 seconds (full day) variation
+    // Time bucket: round created_at down to the nearest hour (3600000 ms = 1 hour)
+    // This groups all events within the same hour into the same partition
+    let time_bucket = (created_at / 3600000) * 3600000;
+    let eqid = `eqid_${i}`;
+    let event_type_id = hash2(i, 1) % HC;
+    let emu_event_id = hash2(i, 2) % MC;
+    let alarm_id = `alarm_${i + 1}`;
+    let event_clear_date = (i + TIME_DELTA) * 1000;
+    let has_state = hash2(i, 3) % LC;
+    let ho_event = hash2(i, 4) % 2;
+    let message_key = hash2(i, 5) % 100;
+    let message_params = `message_params_${i}`;
+    let standing = hash2(i, 6) % LC;
+    // updated_at is slightly after created_at (add 1-1000 seconds)
+    let updated_at = created_at + (hash2(i, 7) % 1000) * 1000;
+    
+    db.execute_prepared(WRITE, [
+        site_id,
+        time_bucket,
+        event_date,
+        eqid,
+        event_type_id,
+        emu_event_id,
+        alarm_id,
+        created_at,
+        event_clear_date,
+        has_state,
+        ho_event,
+        message_key,
+        message_params,
+        standing,
+        updated_at
+    ]).await?;
+    Ok(())
+}
+
+pub async fn run(ctx, i) {
+    // Generate query parameters matching the load function's generated values
+    let site_id = hash_range(i, PAR_COUNT);
+    let base_timestamp = 1700000000000;
+    let days_to_spread = 30;
+    let event_date = base_timestamp + (i * days_to_spread * 86400000 / ROW_COUNT);
+    let created_at = event_date + (hash2(i, 8) % 86400) * 1000;
+    
+    // Calculate time_bucket range based on event_date range
+    let event_date_upper = event_date + 86400000; // Add 1 day
+    let event_date_lower = event_date - 86400000; // Subtract 1 day
+    
+    // Time bucket range: round to nearest hour for lower and upper bounds
+    let time_bucket_lower = (event_date_lower / 3600000) * 3600000;
+    let time_bucket_upper = (event_date_upper / 3600000) * 3600000;
+    
+    let event_type_id = hash2(i, 1) % HC;
+    
+    ctx.execute_prepared(READ, [site_id, time_bucket_lower, time_bucket_upper, event_date_upper, event_date_lower, event_type_id]).await?;
+    Ok(())
+}
+
+// SELECT * FROM events_cdc WHERE site_id=? AND event_date<=? AND event_date>=? AND event_type_id=? 
+// SELECT * FROM events_cdc WHERE site_id = 5895302 AND ho_event = 1 ROWS LIMIT 1000
+// SELECT * FROM events_cdc WHERE site_id = 2483832 AND event_date < 1691558353 AND eqid > 122126085674 AND event_type_id > 539 AND emu_event_id > 249931
+
